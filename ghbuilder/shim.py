@@ -34,6 +34,8 @@ from pathlib import Path
 import pyrage
 import requests
 
+from .results import ResultStore, content_hash
+
 API = "https://api.github.com"
 RUNNER_DATA_DIR = "/home/runner/esphome-data"
 POLL_SECONDS = 3
@@ -210,8 +212,8 @@ def follow_run(gh: GitHub, run_id: int, job: str, sha: str) -> str:
         time.sleep(POLL_SECONDS)
 
 
-def unpack_result(blob: bytes, identity: pyrage.x25519.Identity, data_dir: Path) -> None:
-    plain = pyrage.decrypt(blob, [identity])
+def unpack_plain(plain: bytes, data_dir: Path) -> None:
+    """Extract a result tarball into *data_dir* and point the embedded runner paths at it."""
     data_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(plain), mode="r:gz") as tar:
         tar.extractall(data_dir, filter="data")
@@ -222,6 +224,14 @@ def unpack_result(blob: bytes, identity: pyrage.x25519.Identity, data_dir: Path)
 
 
 def main(argv: list[str]) -> int:
+    try:
+        return run(argv)
+    except KeyError as exc:
+        log(f"ERROR ghbuilder: missing environment variable {exc}")
+        return 1
+
+
+def run(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="esphome")
     ap.add_argument("--esphome-version", required=True)
     ap.add_argument("--dashboard", action="store_true")
@@ -234,13 +244,16 @@ def main(argv: list[str]) -> int:
     gh = GitHub(os.environ["GHB_REPO"], os.environ.get("GH_TOKEN") or os.environ["GITHUB_TOKEN"])
     project = project_key(args.configuration)
 
+    store = ResultStore.from_env()
     if args.command == "clean":
         n = gh.delete_caches(f"build-{project}-")
-        log(f"INFO ghbuilder: deleted {n} build cache(s) for {project}")
+        r = store.delete(project) if store else 0
+        log(f"INFO ghbuilder: deleted {n} build cache(s) and {r} stored result(s) for {project}")
         return 0
     if args.command == "clean-all":
         n = gh.delete_caches()
-        log(f"INFO ghbuilder: cleared {n} GitHub Actions cache(s) of {gh.repo}")
+        r = store.delete() if store else 0
+        log(f"INFO ghbuilder: cleared {n} GitHub Actions cache(s) of {gh.repo} and {r} stored result(s)")
         return 0
     if args.command != "compile":
         log(f"ghbuilder: unsupported command {args.command!r}; only compile/clean/clean-all are offloaded")
@@ -249,6 +262,18 @@ def main(argv: list[str]) -> int:
     pubkey = os.environ["GHB_PUBKEY"]
     data_dir = Path(os.environ["ESPHOME_DATA_DIR"])
     config_path = Path(args.configuration).resolve()
+    digest = content_hash(config_path.parent, config_path.name, args.esphome_version)
+    if store:
+        try:
+            cached = store.get(project, digest)
+        except Exception as exc:  # noqa: BLE001 — a broken result store must never block a build
+            log(f"WARNING ghbuilder: result store unavailable ({exc}); building on GitHub")
+            cached = None
+        if cached is not None:
+            unpack_plain(cached, data_dir)
+            log(f"INFO ghbuilder: {config_path.name} is unchanged since the last build "
+                f"({digest[:12]}); reused stored result, GitHub not used")
+            return 0
     job = uuid.uuid4().hex[:12]
     reply = pyrage.x25519.Identity.generate()
     run_id: int | None = None
@@ -277,7 +302,14 @@ def main(argv: list[str]) -> int:
             log(f"ERROR ghbuilder: GitHub run finished with {conclusion}")
             return 1
         log("INFO ghbuilder: downloading build artefacts")
-        unpack_result(gh.download_result(run_id, job), reply, data_dir)
+        plain = pyrage.decrypt(gh.download_result(run_id, job), [reply])
+        unpack_plain(plain, data_dir)
+        if store:
+            try:
+                store.put(project, digest, plain)
+                log(f"INFO ghbuilder: stored result {digest[:12]}")
+            except Exception as exc:  # noqa: BLE001
+                log(f"WARNING ghbuilder: could not store result ({exc})")
         succeeded = True
         log("INFO ghbuilder: done")
         return 0

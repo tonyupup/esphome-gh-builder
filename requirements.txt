@@ -1,3 +1,4 @@
 requests>=2.31
+boto3>=1.34
 pyrage==1.2.5
 esphome-device-builder[esphome]==1.17.2
