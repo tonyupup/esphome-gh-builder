@@ -53,10 +53,6 @@ jobs:
           key: tools-${{ inputs.esphome_version }}-${{ github.run_id }}
           restore-keys: tools-${{ inputs.esphome_version }}-
 
-      - name: Measure tools cache
-        id: before
-        run: echo "kb=$(du -sk ~/.cache/esphome ~/.platformio ~/.cache/pip 2>/dev/null | awk '{s+=$1} END{print s+0}')" >> "$GITHUB_OUTPUT"
-
       - name: Restore project build cache
         id: pcache
         uses: actions/cache/restore@v4
@@ -67,6 +63,10 @@ jobs:
 
       - name: Install tools
         run: pip install -q "esphome==${{ inputs.esphome_version }}" pyrage==1.2.5
+
+      - name: Measure tools cache
+        id: before
+        run: echo "kb=$(du -sk ~/.cache/esphome ~/.platformio ~/.cache/pip 2>/dev/null | awk '{s+=$1} END{print s+0}')" >> "$GITHUB_OUTPUT"
 
       - name: Decrypt bundle
         env:
@@ -129,10 +129,16 @@ jobs:
       - name: Measure tools cache after
         id: after
         if: always()
-        run: echo "kb=$(du -sk ~/.cache/esphome ~/.platformio ~/.cache/pip 2>/dev/null | awk '{s+=$1} END{print s+0}')" >> "$GITHUB_OUTPUT"
+        env:
+          BEFORE_KB: ${{ steps.before.outputs.kb }}
+          EXACT_HIT: ${{ steps.tools.outputs.cache-hit }}
+        run: |
+          now=$(du -sk ~/.cache/esphome ~/.platformio ~/.cache/pip 2>/dev/null | awk '{s+=$1} END{print s+0}')
+          # 保存条件：没有精确命中，且内容比恢复时多出 5 MB 以上
+          if [ "$EXACT_HIT" != "true" ] && [ "$now" -gt $((BEFORE_KB + 5120)) ]; then echo "save=true" >> "$GITHUB_OUTPUT"; else echo "save=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: Save shared tools cache
-        if: always() && (steps.tools.outputs.cache-hit != 'true') && (steps.after.outputs.kb > steps.before.outputs.kb + 5120)
+        if: always() && steps.after.outputs.save == 'true'
         uses: actions/cache/save@v4
         with:
           path: |
