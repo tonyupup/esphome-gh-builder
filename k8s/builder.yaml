@@ -1,0 +1,96 @@
+# ESPHome remote build server backed by GitHub Actions.
+#
+# Prerequisites (namespace: default):
+#   secret esphome-s3        keys KEY, SECRET     (already created)
+#   secret esphome-gh-token  key  GH_TOKEN        fine-grained PAT limited to tonyupup/esphome-gh-builder:
+#                                                 Contents RW, Actions RW, Checks R, Metadata R
+#     kubectl create secret generic esphome-gh-token -n default --from-literal=GH_TOKEN=github_pat_xxx
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: esphome-gh-builder-data
+  namespace: default
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: nfs-client
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: esphome-gh-builder
+  namespace: default
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: esphome-gh-builder
+  template:
+    metadata:
+      labels:
+        app: esphome-gh-builder
+    spec:
+      containers:
+        - name: builder
+          image: ghcr.io/tonyupup/esphome-gh-builder:latest
+          imagePullPolicy: Always
+          ports:
+            - name: peer-link
+              containerPort: 6055
+          env:
+            - name: GHB_REPO
+              value: tonyupup/esphome-gh-builder
+            - name: GHB_PUBKEY   # age public key of the build repo (BUILD_AGE_KEY is the private half)
+              value: age1s8jmewcjzhnmaktgegrcm8lkehgg6hgawzqnclj4slhyg4352plqkd48r9
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef: {name: esphome-gh-token, key: GH_TOKEN}
+            - name: GHB_S3_ENDPOINT
+              value: http://172.18.0.1:9010
+            - name: GHB_S3_BUCKET
+              value: esphome
+            - name: GHB_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: {name: esphome-s3, key: KEY}
+            - name: GHB_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef: {name: esphome-s3, key: SECRET}
+            # api.github.com goes through the cluster proxy; the S3 host is covered by NO_PROXY.
+            - {name: HTTPS_PROXY, value: "http://172.18.1.1:7893"}
+            - {name: HTTP_PROXY, value: "http://172.18.1.1:7893"}
+            - {name: https_proxy, value: "http://172.18.1.1:7893"}
+            - {name: http_proxy, value: "http://172.18.1.1:7893"}
+            - {name: NO_PROXY, value: "localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.cluster.local,.a.zltop.cn"}
+            - {name: no_proxy, value: "localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.cluster.local,.a.zltop.cn"}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          readinessProbe:
+            tcpSocket: {port: 6055}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {memory: 1Gi}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: esphome-gh-builder-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: esphome-gh-builder
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: esphome-gh-builder
+  ports:
+    - name: peer-link
+      port: 6055
+      targetPort: 6055
+      nodePort: 30655
