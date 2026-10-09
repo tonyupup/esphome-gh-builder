@@ -101,10 +101,15 @@ class GitHub:
     def cancel(self, run_id: int) -> None:
         self.call("POST", f"actions/runs/{run_id}/cancel", ok=(202, 409, 404))
 
-    def cleanup(self, job: str, run_id: int | None) -> None:
+    def cleanup(self, job: str, run_id: int | None, succeeded: bool = False) -> None:
+        """Delete the job branch; delete the run too unless GHB_KEEP_RUNS says to keep it.
+
+        GHB_KEEP_RUNS: ``failed`` (default; keep failed/cancelled runs for debugging), ``all`` or ``none``.
+        """
+        keep = os.environ.get("GHB_KEEP_RUNS", "failed")
         try:
             self.call("DELETE", f"git/refs/heads/job/{job}", ok=(204, 404, 422))
-            if run_id and not os.environ.get("GHB_KEEP_RUN"):
+            if run_id and keep != "all" and (keep == "none" or succeeded):
                 self.call("DELETE", f"actions/runs/{run_id}", ok=(204, 404, 409))
         except Exception:  # noqa: BLE001 — best effort
             pass
@@ -247,6 +252,7 @@ def main(argv: list[str]) -> int:
     job = uuid.uuid4().hex[:12]
     reply = pyrage.x25519.Identity.generate()
     run_id: int | None = None
+    succeeded = False
 
     def on_term(*_):
         if run_id:
@@ -272,13 +278,14 @@ def main(argv: list[str]) -> int:
             return 1
         log("INFO ghbuilder: downloading build artefacts")
         unpack_result(gh.download_result(run_id, job), reply, data_dir)
+        succeeded = True
         log("INFO ghbuilder: done")
         return 0
     except Exception as exc:  # noqa: BLE001 — surface any failure as a failed build
         log(f"ERROR ghbuilder: {exc}")
         return 1
     finally:
-        gh.cleanup(job, run_id)
+        gh.cleanup(job, run_id, succeeded)
 
 
 if __name__ == "__main__":
