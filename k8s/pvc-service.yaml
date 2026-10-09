@@ -1,0 +1,33 @@
+# Prerequisites (namespace: default):
+#   secret esphome-s3        keys KEY, SECRET     (already created)
+#   secret esphome-gh-token  key  GH_TOKEN        fine-grained PAT limited to tonyupup/esphome-gh-builder:
+#                                                 Contents RW, Actions RW, Checks R, Metadata R
+#     kubectl create secret generic esphome-gh-token -n default --from-literal=GH_TOKEN=github_pat_xxx
+# Apply order: this file, then `kubectl patch deploy esphome -n default --patch-file k8s/esphome-patch.yaml`
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: esphome-gh-builder-data
+  namespace: default
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: nfs-client
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: esphome-gh-builder
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: esphome      # the esphome Deployment's pod
+  ports:
+    - name: peer-link
+      port: 6055
+      targetPort: 6055
+      nodePort: 30655
