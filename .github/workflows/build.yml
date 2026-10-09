@@ -21,7 +21,8 @@ on:
         required: true
 
 permissions:
-  contents: write   # push encrypted log chunks to the job/<id> branch
+  contents: read
+  checks: write     # live log is published through a check run
 
 env:
   DATA_DIR: /home/runner/esphome-data
@@ -97,12 +98,13 @@ jobs:
                   for part in v.splitlines(): print(f"::add-mask::{part}")
           EOF
 
-      # 编译输出不进 Actions 日志，写文件后由 stream_log.py 脱敏、分块推到 job 分支，供适配器实时读取。
+      # 编译输出不进 Actions 日志，写文件后由 stream_log.py 脱敏后通过 check run 实时发布，供适配器轮询。
       - name: Compile
         id: compile
         env:
           ESPHOME_DATA_DIR: ${{ env.DATA_DIR }}
-          JOB_BRANCH: job/${{ inputs.job }}
+          GITHUB_TOKEN: ${{ github.token }}
+          JOB_ID: ${{ inputs.job }}
         run: |
           cfg="$(python -c "import json;print(json.load(open('/tmp/cfg/.ghbuild.json'))['configuration'])")"
           rm -f /tmp/compile.done; : > /tmp/compile.log

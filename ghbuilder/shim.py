@@ -71,14 +71,16 @@ class GitHub:
         return self.call("GET", path, **kw).json()
 
     # -- bundle upload -------------------------------------------------------------------
-    def push_bundle(self, job: str, encrypted: bytes) -> None:
+    def push_bundle(self, job: str, encrypted: bytes) -> str:
+        """Upload the encrypted bundle to a new branch; return the commit sha (anchor of the log check run)."""
         default = self.get("")["default_branch"]
         sha = self.get(f"git/ref/heads/{default}")["object"]["sha"]
         self.call("POST", "git/refs", json={"ref": f"refs/heads/job/{job}", "sha": sha})
-        self.call(
+        resp = self.call(
             "PUT", "contents/bundle.tar.gz.age",
             json={"message": f"job {job}", "branch": f"job/{job}", "content": base64.b64encode(encrypted).decode()},
         )
+        return resp.json()["commit"]["sha"]
 
     # -- run lifecycle -------------------------------------------------------------------
     def dispatch(self, job: str, version: str, reply_pubkey: str, project: str) -> int:
@@ -108,24 +110,20 @@ class GitHub:
             pass
 
     # -- logs ----------------------------------------------------------------------------
-    def log_chunks(self, job: str, seen: set[str]) -> list[str]:
-        """Return text of new ``logs/*`` chunks on the job branch, in order."""
-        resp = self.call("GET", f"contents/logs?ref=job/{job}", ok=(200, 404))
-        if resp.status_code == 404:
-            return []
-        out = []
-        for entry in sorted(resp.json(), key=lambda e: e["name"]):
-            if entry["name"] in seen:
-                continue
-            raw = self.call(
-                "GET", f"contents/logs/{entry['name']}?ref=job/{job}",
-                ok=(200, 404), headers={"Accept": "application/vnd.github.raw+json"},
-            )
-            if raw.status_code != 200:
-                break  # not readable yet; keep order, retry next poll
-            seen.add(entry["name"])
-            out.append(raw.content.decode(errors="replace"))
-        return out
+    def read_log_window(self, sha: str, job: str) -> tuple[int, str] | None:
+        """Return ``(end, text)`` of the live-log check run, or None if it does not exist yet.
+
+        ``text`` is the tail of the redacted log and ``end`` the total characters emitted, so the
+        window covers ``[end - len(text), end)``.
+        """
+        runs = self.get(f"commits/{sha}/check-runs", params={"check_name": f"log-{job}"})["check_runs"]
+        if not runs:
+            return None
+        out = runs[0].get("output") or {}
+        title = out.get("title") or ""
+        if not title.startswith("end="):
+            return None
+        return int(title[4:]), out.get("text") or ""
 
     # -- artefacts -----------------------------------------------------------------------
     def download_result(self, run_id: int, job: str) -> bytes:
@@ -173,9 +171,9 @@ def project_key(config_path: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", Path(config_path).stem)[:60] or "default"
 
 
-def follow_run(gh: GitHub, run_id: int, job: str) -> str:
-    """Print step progress and live log chunks until the run ends; return its conclusion."""
-    seen: set[str] = set()
+def follow_run(gh: GitHub, run_id: int, job: str, sha: str) -> str:
+    """Print step progress and live log text until the run ends; return its conclusion."""
+    pos = 0  # characters of the log already printed
     started_steps: set[str] = set()
     final = False
     while True:
@@ -188,9 +186,17 @@ def follow_run(gh: GitHub, run_id: int, job: str) -> str:
             if step["status"] in ("in_progress", "completed"):
                 started_steps.add(name)
                 log(f"INFO ghbuilder: {name}...")
-        for text in gh.log_chunks(job, seen):
-            sys.stdout.write(text)
-            sys.stdout.flush()
+        window = gh.read_log_window(sha, job)
+        if window:
+            end, text = window
+            start = end - len(text)
+            if pos < start:
+                log(f"WARNING ghbuilder: skipped {start - pos} characters of log output")
+                pos = start
+            if end > pos:
+                sys.stdout.write(text[pos - start :])
+                sys.stdout.flush()
+                pos = end
         if run["status"] == "completed":
             if final:
                 return run["conclusion"] or "failure"
@@ -256,10 +262,10 @@ def main(argv: list[str]) -> int:
         bundle = make_bundle(config_path)
         encrypted = pyrage.encrypt(bundle, [pyrage.x25519.Recipient.from_str(pubkey)])
         log(f"INFO ghbuilder: uploading encrypted bundle ({len(encrypted) // 1024} KiB) to {gh.repo}")
-        gh.push_bundle(job, encrypted)
+        sha = gh.push_bundle(job, encrypted)
         run_id = gh.dispatch(job, args.esphome_version, str(reply.to_public()), project)
         log(f"INFO ghbuilder: GitHub run {run_id} started")
-        conclusion = follow_run(gh, run_id, job)
+        conclusion = follow_run(gh, run_id, job, sha)
         if conclusion != "success":
             log(f"ERROR ghbuilder: GitHub run finished with {conclusion}")
             return 1
