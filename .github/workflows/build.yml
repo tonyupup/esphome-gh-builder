@@ -16,6 +16,9 @@ on:
       reply_pubkey:
         description: age recipient used to encrypt the result
         required: true
+      project:
+        description: sanitised config name, used only as a per-project build-cache key
+        required: true
 
 permissions:
   contents: read
@@ -43,6 +46,14 @@ jobs:
             ~/.cache/pip
           key: pio-${{ inputs.esphome_version }}-${{ github.run_id }}
           restore-keys: pio-${{ inputs.esphome_version }}-
+
+      - name: Restore project build cache
+        id: pcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DATA_DIR }}/build
+          key: build-${{ inputs.project }}-${{ inputs.esphome_version }}-${{ github.run_id }}
+          restore-keys: build-${{ inputs.project }}-${{ inputs.esphome_version }}-
 
       - name: Install tools
         run: pip install -q "esphome==${{ inputs.esphome_version }}" pyrage==1.2.5
@@ -82,6 +93,13 @@ jobs:
         run: |
           cfg="$(python -c "import json;print(json.load(open('/tmp/cfg/.ghbuild.json'))['configuration'])")"
           esphome --dashboard compile "$cfg"
+
+      - name: Save project build cache
+        if: always() && steps.compile.conclusion != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.DATA_DIR }}/build
+          key: build-${{ inputs.project }}-${{ inputs.esphome_version }}-${{ github.run_id }}
 
       - name: Pack and encrypt result
         if: success()

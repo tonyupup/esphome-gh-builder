@@ -87,11 +87,17 @@ def push_bundle(repo: str, job: str, encrypted: bytes) -> None:
     )
 
 
-def dispatch(repo: str, job: str, version: str, reply_pubkey: str) -> int:
+def project_key(config_path: str) -> str:
+    """Cache-key-safe name of a config (its YAML stem)."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", Path(config_path).stem)[:60] or "default"
+
+
+def dispatch(repo: str, job: str, version: str, reply_pubkey: str, project: str) -> int:
     started = time.time()
     gh(
         "workflow", "run", WORKFLOW, "-R", repo, "--ref", "main",
         "-f", f"job={job}", "-f", f"esphome_version={version}", "-f", f"reply_pubkey={reply_pubkey}",
+        "-f", f"project={project}",
     )
     deadline = started + 120
     while time.time() < deadline:
@@ -161,7 +167,11 @@ def main(argv: list[str]) -> int:
     args, _ = ap.parse_known_args(argv)
     repo = os.environ["GHB_REPO"]
     if args.command == "clean":
-        log("INFO ghbuilder: nothing to clean locally; builds run on GitHub Actions")
+        prefix = f"build-{project_key(args.configuration)}-"
+        caches = gh_json("cache", "list", "-R", repo, "--key", prefix, "--json", "id,key", "-L", "100") or []
+        for c in caches:
+            gh("cache", "delete", str(c["id"]), "-R", repo, check=False)
+        log(f"INFO ghbuilder: deleted {len(caches)} build cache(s) for {project_key(args.configuration)}")
         return 0
     if args.command == "clean-all":
         proc = gh("cache", "delete", "--all", "-R", repo, check=False)
@@ -194,7 +204,7 @@ def main(argv: list[str]) -> int:
         encrypted = pyrage.encrypt(bundle, [pyrage.x25519.Recipient.from_str(pubkey)])
         log(f"INFO ghbuilder: uploading encrypted bundle ({len(encrypted) // 1024} KiB) to {repo}")
         push_bundle(repo, job, encrypted)
-        run_id = dispatch(repo, job, args.esphome_version, str(reply.to_public()))
+        run_id = dispatch(repo, job, args.esphome_version, str(reply.to_public()), project_key(args.configuration))
         log(f"INFO ghbuilder: GitHub run {run_id} started")
         conclusion = stream_logs(repo, run_id, state)
         if conclusion != "success":
