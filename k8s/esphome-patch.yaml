@@ -6,7 +6,7 @@ spec:
     spec:
       containers:
         - name: gh-builder
-          image: ghcr.io/tonyupup/esphome-gh-builder:latest
+          image: ghcr.dockerproxy.zltop.cn/tonyupup/esphome-gh-builder:latest
           imagePullPolicy: Always
           env:
             - name: GHB_REPO
