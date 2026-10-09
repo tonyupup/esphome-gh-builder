@@ -40,13 +40,22 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: actions/cache@v4
+      # 所有项目共用的工具缓存：ESP-IDF / Arduino 框架 / 工具链 / pip。
+      # 缓存不可变，所以只在内容增长（装了新平台或新版本）时才用新 key 保存一份。
+      - name: Restore shared tools cache
+        id: tools
+        uses: actions/cache/restore@v4
         with:
           path: |
+            ~/.cache/esphome
             ~/.platformio
             ~/.cache/pip
-          key: pio-${{ inputs.esphome_version }}-${{ github.run_id }}
-          restore-keys: pio-${{ inputs.esphome_version }}-
+          key: tools-${{ inputs.esphome_version }}-${{ github.run_id }}
+          restore-keys: tools-${{ inputs.esphome_version }}-
+
+      - name: Measure tools cache
+        id: before
+        run: echo "kb=$(du -sk ~/.cache/esphome ~/.platformio ~/.cache/pip 2>/dev/null | awk '{s+=$1} END{print s+0}')" >> "$GITHUB_OUTPUT"
 
       - name: Restore project build cache
         id: pcache
@@ -116,6 +125,21 @@ jobs:
           touch /tmp/compile.done
           wait $streamer
           exit $rc
+
+      - name: Measure tools cache after
+        id: after
+        if: always()
+        run: echo "kb=$(du -sk ~/.cache/esphome ~/.platformio ~/.cache/pip 2>/dev/null | awk '{s+=$1} END{print s+0}')" >> "$GITHUB_OUTPUT"
+
+      - name: Save shared tools cache
+        if: always() && (steps.tools.outputs.cache-hit != 'true') && (steps.after.outputs.kb > steps.before.outputs.kb + 5120)
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/esphome
+            ~/.platformio
+            ~/.cache/pip
+          key: tools-${{ inputs.esphome_version }}-${{ github.run_id }}
 
       - name: Save project build cache
         if: always() && steps.compile.conclusion != 'skipped'
