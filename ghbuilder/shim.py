@@ -156,11 +156,19 @@ def main(argv: list[str]) -> int:
     ap.add_argument("command")
     ap.add_argument("configuration")
     args, _ = ap.parse_known_args(argv)
+    repo = os.environ["GHB_REPO"]
+    if args.command == "clean":
+        log("INFO ghbuilder: nothing to clean locally; builds run on GitHub Actions")
+        return 0
+    if args.command == "clean-all":
+        proc = gh("cache", "delete", "--all", "-R", repo, check=False)
+        out = (proc.stdout + proc.stderr).decode(errors="replace").strip()
+        log(f"INFO ghbuilder: cleared GitHub Actions caches of {repo}" + (f" ({out})" if out else ""))
+        return proc.returncode
     if args.command != "compile":
-        log(f"ghbuilder: unsupported command {args.command!r}; only 'compile' is offloaded")
+        log(f"ghbuilder: unsupported command {args.command!r}; only compile/clean/clean-all are offloaded")
         return 2
-
-    repo, pubkey = os.environ["GHB_REPO"], os.environ["GHB_PUBKEY"]
+    pubkey = os.environ["GHB_PUBKEY"]
     data_dir = Path(os.environ["ESPHOME_DATA_DIR"])
     config_path = Path(args.configuration).resolve()
     job = uuid.uuid4().hex[:12]
