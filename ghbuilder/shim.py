@@ -46,7 +46,10 @@ def log(msg: str) -> None:
 
 
 def gh(*args: str, check: bool = True, input_: bytes | None = None) -> subprocess.CompletedProcess:
-    proc = subprocess.run(["gh", *args], capture_output=True, input=input_, check=False)
+    # The receiver exports FORCE_COLOR/CLICOLOR_FORCE for esphome; gh would colourise its JSON.
+    env = {k: v for k, v in os.environ.items() if k not in ("FORCE_COLOR", "CLICOLOR_FORCE", "GH_FORCE_TTY")}
+    env["NO_COLOR"] = "1"
+    proc = subprocess.run(["gh", *args], capture_output=True, input=input_, check=False, env=env)
     if check and proc.returncode:
         raise RuntimeError(f"gh {' '.join(args[:3])} failed: {proc.stderr.decode(errors='replace').strip()}")
     return proc
