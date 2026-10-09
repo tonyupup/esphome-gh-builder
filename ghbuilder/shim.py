@@ -143,13 +143,16 @@ class GitHub:
             return zf.read("result.tar.gz.age")
 
     # -- caches --------------------------------------------------------------------------
-    def delete_caches(self, key_prefix: str | None = None) -> int:
+    def delete_caches(self, key_prefix: str | None = None, key_regex: str | None = None) -> int:
+        """Delete caches by key prefix (optionally narrowed by *key_regex*), or all of them."""
         deleted = 0
+        pattern = re.compile(key_regex) if key_regex else None
         while True:
             params = {"per_page": 100}
             if key_prefix:
                 params["key"] = key_prefix
             caches = self.get("actions/caches", params=params)["actions_caches"]
+            caches = [c for c in caches if pattern is None or pattern.search(c["key"])]
             if not caches:
                 return deleted
             for c in caches:
@@ -246,7 +249,8 @@ def run(argv: list[str]) -> int:
 
     store = ResultStore.from_env()
     if args.command == "clean":
-        n = gh.delete_caches(f"build-{project}-")
+        # build-<project>-<esphome version>-<run id>; match it fully so "light" never deletes "light-01"
+        n = gh.delete_caches(f"build-{project}-", rf"^build-{re.escape(project)}-[^-]+-\d+$")
         r = store.delete(project) if store else 0
         log(f"INFO ghbuilder: deleted {n} build cache(s) and {r} stored result(s) for {project}")
         return 0

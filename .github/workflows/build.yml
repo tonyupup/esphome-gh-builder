@@ -23,6 +23,7 @@ on:
 permissions:
   contents: read
   checks: write     # live log is published through a check run
+  actions: write    # delete superseded caches
 
 env:
   DATA_DIR: /home/runner/esphome-data
@@ -157,6 +158,24 @@ jobs:
             ${{ env.DATA_DIR }}/build
             ${{ env.DATA_DIR }}/storage
           key: build-${{ inputs.project }}-${{ inputs.esphome_version }}-${{ github.run_id }}
+
+      # 只保留最新一份：工具缓存按 esphome 版本一份，项目缓存按 (项目, 版本) 一份。
+      # 用完整格式匹配，避免 "light" 误删 "light-01"。
+      - name: Prune superseded caches
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.esphome_version }}
+          PROJECT: ${{ inputs.project }}
+        run: |
+          v="${VERSION//./\\.}"
+          prune() {
+            gh cache list -R "$GITHUB_REPOSITORY" --sort created_at --order desc -L 100 --json id,key \
+              | jq -r --arg re "$1" '[.[] | select(.key | test($re))] | .[1:] | .[].id' \
+              | xargs -r -n1 gh cache delete -R "$GITHUB_REPOSITORY"
+          }
+          prune "^tools-${v}-[0-9]+$"
+          prune "^build-${PROJECT}-${v}-[0-9]+$"
 
       - name: Pack and encrypt result
         if: success()
