@@ -72,17 +72,41 @@ jobs:
           mkdir -p /tmp/cfg && tar -xzf /tmp/bundle.tar.gz -C /tmp/cfg
           rm /tmp/bundle.tar.gz
 
-      # 编译输出不进公开的 Actions 日志，而是写文件，由 stream_log.py 加密后分块推到 job 分支。
+      # 收集所有需要脱敏的值：secrets.yaml 全部值 + 各 YAML 里 password/key/psk/token 等字段。
+      - name: Collect redactions
+        run: |
+          python - <<'EOF'
+          import glob, json, yaml
+          class L(yaml.SafeLoader): pass
+          L.add_multi_constructor("", lambda loader, suffix, node: None)
+          vals, hot = set(), ("password", "key", "psk", "token", "secret", "passphrase")
+          def walk(o, top=False):
+              if isinstance(o, dict):
+                  for k, v in o.items():
+                      if top or any(h in str(k).lower() for h in hot):
+                          if isinstance(v, (str, int)): vals.add(str(v))
+                      walk(v)
+              elif isinstance(o, list):
+                  for i in o: walk(i)
+          for p in glob.glob("/tmp/cfg/**/*.y*ml", recursive=True):
+              try: walk(yaml.load(open(p), L), top=p.endswith("secrets.yaml"))
+              except Exception: pass
+          json.dump(sorted(vals), open("/tmp/redact.json", "w"))
+          for v in vals:
+              if len(v) >= 4:
+                  for part in v.splitlines(): print(f"::add-mask::{part}")
+          EOF
+
+      # 编译输出不进 Actions 日志，写文件后由 stream_log.py 脱敏、分块推到 job 分支，供适配器实时读取。
       - name: Compile
         id: compile
         env:
           ESPHOME_DATA_DIR: ${{ env.DATA_DIR }}
-          REPLY_PUBKEY: ${{ inputs.reply_pubkey }}
           JOB_BRANCH: job/${{ inputs.job }}
         run: |
           cfg="$(python -c "import json;print(json.load(open('/tmp/cfg/.ghbuild.json'))['configuration'])")"
           rm -f /tmp/compile.done; : > /tmp/compile.log
-          python ghbuilder/stream_log.py /tmp/compile.log /tmp/compile.done "$REPLY_PUBKEY" &
+          python ghbuilder/stream_log.py /tmp/compile.log /tmp/compile.done /tmp/redact.json &
           streamer=$!
           set +e
           (cd /tmp/cfg && esphome --dashboard compile "$cfg") > /tmp/compile.log 2>&1

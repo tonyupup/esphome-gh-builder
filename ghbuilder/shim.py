@@ -24,16 +24,17 @@ import json
 import os
 import re
 import signal
-import subprocess
 import sys
 import tarfile
-import tempfile
 import time
 import uuid
+import zipfile
 from pathlib import Path
 
 import pyrage
+import requests
 
+API = "https://api.github.com"
 RUNNER_DATA_DIR = "/home/runner/esphome-data"
 POLL_SECONDS = 3
 WORKFLOW = "build.yml"
@@ -45,18 +46,109 @@ def log(msg: str) -> None:
     sys.stdout.flush()
 
 
-def gh(*args: str, check: bool = True, input_: bytes | None = None) -> subprocess.CompletedProcess:
-    # The receiver exports FORCE_COLOR/CLICOLOR_FORCE for esphome; gh would colourise its JSON.
-    env = {k: v for k, v in os.environ.items() if k not in ("FORCE_COLOR", "CLICOLOR_FORCE", "GH_FORCE_TTY")}
-    env["NO_COLOR"] = "1"
-    proc = subprocess.run(["gh", *args], capture_output=True, input=input_, check=False, env=env)
-    if check and proc.returncode:
-        raise RuntimeError(f"gh {' '.join(args[:3])} failed: {proc.stderr.decode(errors='replace').strip()}")
-    return proc
+class GitHub:
+    """Minimal GitHub REST client for one repository."""
 
+    def __init__(self, repo: str, token: str) -> None:
+        self.repo = repo
+        self.s = requests.Session()
+        self.s.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+        )
 
-def gh_json(*args: str):
-    return json.loads(gh(*args).stdout or b"null")
+    def call(self, method: str, path: str, ok: tuple[int, ...] = (200, 201, 202, 204), **kw) -> requests.Response:
+        resp = self.s.request(method, f"{API}/repos/{self.repo}/{path}", timeout=60, **kw)
+        if resp.status_code not in ok:
+            raise RuntimeError(f"GitHub {method} {path.split('?')[0]} -> {resp.status_code}: {resp.text[:200]}")
+        return resp
+
+    def get(self, path: str, **kw):
+        return self.call("GET", path, **kw).json()
+
+    # -- bundle upload -------------------------------------------------------------------
+    def push_bundle(self, job: str, encrypted: bytes) -> None:
+        default = self.get("")["default_branch"]
+        sha = self.get(f"git/ref/heads/{default}")["object"]["sha"]
+        self.call("POST", "git/refs", json={"ref": f"refs/heads/job/{job}", "sha": sha})
+        self.call(
+            "PUT", "contents/bundle.tar.gz.age",
+            json={"message": f"job {job}", "branch": f"job/{job}", "content": base64.b64encode(encrypted).decode()},
+        )
+
+    # -- run lifecycle -------------------------------------------------------------------
+    def dispatch(self, job: str, version: str, reply_pubkey: str, project: str) -> int:
+        self.call(
+            "POST", f"actions/workflows/{WORKFLOW}/dispatches",
+            json={"ref": "main", "inputs": {"job": job, "esphome_version": version,
+                                            "reply_pubkey": reply_pubkey, "project": project}},
+        )
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            runs = self.get(f"actions/workflows/{WORKFLOW}/runs", params={"event": "workflow_dispatch", "per_page": 30})
+            for run in runs["workflow_runs"]:
+                if run["display_title"] == f"build {job}":
+                    return int(run["id"])
+            time.sleep(2)
+        raise RuntimeError("workflow run did not appear within 120s")
+
+    def cancel(self, run_id: int) -> None:
+        self.call("POST", f"actions/runs/{run_id}/cancel", ok=(202, 409, 404))
+
+    def cleanup(self, job: str, run_id: int | None) -> None:
+        try:
+            self.call("DELETE", f"git/refs/heads/job/{job}", ok=(204, 404, 422))
+            if run_id and not os.environ.get("GHB_KEEP_RUN"):
+                self.call("DELETE", f"actions/runs/{run_id}", ok=(204, 404, 409))
+        except Exception:  # noqa: BLE001 — best effort
+            pass
+
+    # -- logs ----------------------------------------------------------------------------
+    def log_chunks(self, job: str, seen: set[str]) -> list[str]:
+        """Return text of new ``logs/*`` chunks on the job branch, in order."""
+        resp = self.call("GET", f"contents/logs?ref=job/{job}", ok=(200, 404))
+        if resp.status_code == 404:
+            return []
+        out = []
+        for entry in sorted(resp.json(), key=lambda e: e["name"]):
+            if entry["name"] in seen:
+                continue
+            raw = self.call(
+                "GET", f"contents/logs/{entry['name']}?ref=job/{job}",
+                ok=(200, 404), headers={"Accept": "application/vnd.github.raw+json"},
+            )
+            if raw.status_code != 200:
+                break  # not readable yet; keep order, retry next poll
+            seen.add(entry["name"])
+            out.append(raw.content.decode(errors="replace"))
+        return out
+
+    # -- artefacts -----------------------------------------------------------------------
+    def download_result(self, run_id: int, job: str) -> bytes:
+        arts = self.get(f"actions/runs/{run_id}/artifacts")["artifacts"]
+        art = next((a for a in arts if a["name"] == f"result-{job}"), None)
+        if art is None:
+            raise RuntimeError("result artifact not found")
+        resp = self.call("GET", f"actions/artifacts/{art['id']}/zip", allow_redirects=True)
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            return zf.read("result.tar.gz.age")
+
+    # -- caches --------------------------------------------------------------------------
+    def delete_caches(self, key_prefix: str | None = None) -> int:
+        deleted = 0
+        while True:
+            params = {"per_page": 100}
+            if key_prefix:
+                params["key"] = key_prefix
+            caches = self.get("actions/caches", params=params)["actions_caches"]
+            if not caches:
+                return deleted
+            for c in caches:
+                self.call("DELETE", f"actions/caches/{c['id']}", ok=(200, 204, 404))
+                deleted += 1
 
 
 def make_bundle(config_path: Path) -> bytes:
@@ -75,78 +167,29 @@ def make_bundle(config_path: Path) -> bytes:
     return buf.getvalue()
 
 
-def push_bundle(repo: str, job: str, encrypted: bytes) -> None:
-    default = gh_json("api", f"repos/{repo}", "-q", ".")["default_branch"]
-    sha = gh("api", f"repos/{repo}/git/ref/heads/{default}", "-q", ".object.sha").stdout.decode().strip()
-    gh("api", f"repos/{repo}/git/refs", "-f", f"ref=refs/heads/job/{job}", "-f", f"sha={sha}")
-    gh(
-        "api", "-X", "PUT", f"repos/{repo}/contents/bundle.tar.gz.age",
-        "-f", f"message=job {job}",
-        "-f", f"branch=job/{job}",
-        "-f", f"content={base64.b64encode(encrypted).decode()}",
-    )
-
-
 def project_key(config_path: str) -> str:
     """Cache-key-safe name of a config (its YAML stem)."""
     return re.sub(r"[^A-Za-z0-9_-]", "_", Path(config_path).stem)[:60] or "default"
 
 
-def dispatch(repo: str, job: str, version: str, reply_pubkey: str, project: str) -> int:
-    started = time.time()
-    gh(
-        "workflow", "run", WORKFLOW, "-R", repo, "--ref", "main",
-        "-f", f"job={job}", "-f", f"esphome_version={version}", "-f", f"reply_pubkey={reply_pubkey}",
-        "-f", f"project={project}",
-    )
-    deadline = started + 120
-    while time.time() < deadline:
-        runs = gh_json(
-            "run", "list", "-R", repo, "--workflow", WORKFLOW, "--event", "workflow_dispatch",
-            "--json", "databaseId,displayTitle", "-L", "30",
-        )
-        for run in runs or []:
-            if run["displayTitle"] == f"build {job}":
-                return int(run["databaseId"])
-        time.sleep(2)
-    raise RuntimeError("workflow run did not appear within 120s")
-
-
-def stream_logs(repo: str, run_id: int, job: str, identity: pyrage.x25519.Identity) -> str:
-    """Follow the run: print step progress, then decrypted log chunks pushed to the job branch."""
+def follow_run(gh: GitHub, run_id: int, job: str) -> str:
+    """Print step progress and live log chunks until the run ends; return its conclusion."""
     seen: set[str] = set()
-    steps_seen: dict[str, str] = {}
-
-    def drain_chunks() -> None:
-        proc = gh("api", f"repos/{repo}/contents/logs?ref=job/{job}", check=False)
-        if proc.returncode:
-            return
-        for entry in sorted(json.loads(proc.stdout), key=lambda e: e["name"]):
-            if entry["name"] in seen:
-                continue
-            raw = gh(
-                "api", "-H", "Accept: application/vnd.github.raw",
-                f"repos/{repo}/contents/logs/{entry['name']}?ref=job/{job}", check=False,
-            )
-            if raw.returncode:
-                break  # not readable yet; retry next poll, keeping order
-            seen.add(entry["name"])
-            sys.stdout.write(pyrage.decrypt(raw.stdout, [identity]).decode(errors="replace"))
-            sys.stdout.flush()
-
+    started_steps: set[str] = set()
     final = False
     while True:
-        run = gh_json("api", f"repos/{repo}/actions/runs/{run_id}", "-q", ".")
-        jobs = gh_json("api", f"repos/{repo}/actions/runs/{run_id}/jobs", "-q", ".jobs") or []
-        for step in (jobs[0]["steps"] if jobs else []):
+        run = gh.get(f"actions/runs/{run_id}")
+        jobs = gh.get(f"actions/runs/{run_id}/jobs")["jobs"]
+        for step in jobs[0]["steps"] if jobs else []:
             name = step["name"]
-            if name == "Compile" or name.startswith(("Post ", "Complete")) or name == "Set up job":
+            if name in started_steps or name in ("Set up job", "Compile") or name.startswith(("Post ", "Complete")):
                 continue
-            if step["status"] != steps_seen.get(name) and step["status"] in ("in_progress", "completed"):
-                steps_seen[name] = step["status"]
-                if step["status"] == "in_progress":
-                    log(f"INFO ghbuilder: {name}...")
-        drain_chunks()
+            if step["status"] in ("in_progress", "completed"):
+                started_steps.add(name)
+                log(f"INFO ghbuilder: {name}...")
+        for text in gh.log_chunks(job, seen):
+            sys.stdout.write(text)
+            sys.stdout.flush()
         if run["status"] == "completed":
             if final:
                 return run["conclusion"] or "failure"
@@ -155,11 +198,8 @@ def stream_logs(repo: str, run_id: int, job: str, identity: pyrage.x25519.Identi
         time.sleep(POLL_SECONDS)
 
 
-def fetch_result(repo: str, run_id: int, job: str, identity: str, data_dir: Path) -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        gh("run", "download", str(run_id), "-R", repo, "-n", f"result-{job}", "-D", tmp)
-        blob = (Path(tmp) / "result.tar.gz.age").read_bytes()
-    plain = pyrage.decrypt(blob, [pyrage.x25519.Identity.from_str(identity)])
+def unpack_result(blob: bytes, identity: pyrage.x25519.Identity, data_dir: Path) -> None:
+    plain = pyrage.decrypt(blob, [identity])
     data_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(plain), mode="r:gz") as tar:
         tar.extractall(data_dir, filter="data")
@@ -167,12 +207,6 @@ def fetch_result(repo: str, run_id: int, job: str, identity: str, data_dir: Path
     for pattern in ("idedata/*.json", "storage/*.json"):
         for p in data_dir.glob(pattern):
             p.write_text(p.read_text().replace(RUNNER_DATA_DIR, str(data_dir)))
-
-
-def cleanup(repo: str, job: str, run_id: int | None) -> None:
-    gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/job/{job}", check=False)
-    if run_id and not os.environ.get("GHB_KEEP_RUN"):
-        gh("api", "-X", "DELETE", f"repos/{repo}/actions/runs/{run_id}", check=False)
 
 
 def main(argv: list[str]) -> int:
@@ -184,22 +218,22 @@ def main(argv: list[str]) -> int:
     ap.add_argument("command")
     ap.add_argument("configuration")
     args, _ = ap.parse_known_args(argv)
-    repo = os.environ["GHB_REPO"]
+
+    gh = GitHub(os.environ["GHB_REPO"], os.environ.get("GH_TOKEN") or os.environ["GITHUB_TOKEN"])
+    project = project_key(args.configuration)
+
     if args.command == "clean":
-        prefix = f"build-{project_key(args.configuration)}-"
-        caches = gh_json("cache", "list", "-R", repo, "--key", prefix, "--json", "id,key", "-L", "100") or []
-        for c in caches:
-            gh("cache", "delete", str(c["id"]), "-R", repo, check=False)
-        log(f"INFO ghbuilder: deleted {len(caches)} build cache(s) for {project_key(args.configuration)}")
+        n = gh.delete_caches(f"build-{project}-")
+        log(f"INFO ghbuilder: deleted {n} build cache(s) for {project}")
         return 0
     if args.command == "clean-all":
-        proc = gh("cache", "delete", "--all", "-R", repo, check=False)
-        out = (proc.stdout + proc.stderr).decode(errors="replace").strip()
-        log(f"INFO ghbuilder: cleared GitHub Actions caches of {repo}" + (f" ({out})" if out else ""))
-        return proc.returncode
+        n = gh.delete_caches()
+        log(f"INFO ghbuilder: cleared {n} GitHub Actions cache(s) of {gh.repo}")
+        return 0
     if args.command != "compile":
         log(f"ghbuilder: unsupported command {args.command!r}; only compile/clean/clean-all are offloaded")
         return 2
+
     pubkey = os.environ["GHB_PUBKEY"]
     data_dir = Path(os.environ["ESPHOME_DATA_DIR"])
     config_path = Path(args.configuration).resolve()
@@ -209,8 +243,8 @@ def main(argv: list[str]) -> int:
 
     def on_term(*_):
         if run_id:
-            gh("run", "cancel", str(run_id), "-R", repo, check=False)
-        cleanup(repo, job, None)
+            gh.cancel(run_id)
+        gh.cleanup(job, None)
         os._exit(143)
 
     signal.signal(signal.SIGTERM, on_term)
@@ -220,23 +254,23 @@ def main(argv: list[str]) -> int:
         log(f"INFO ghbuilder: bundling {config_path.name} for esphome {args.esphome_version}")
         bundle = make_bundle(config_path)
         encrypted = pyrage.encrypt(bundle, [pyrage.x25519.Recipient.from_str(pubkey)])
-        log(f"INFO ghbuilder: uploading encrypted bundle ({len(encrypted) // 1024} KiB) to {repo}")
-        push_bundle(repo, job, encrypted)
-        run_id = dispatch(repo, job, args.esphome_version, str(reply.to_public()), project_key(args.configuration))
+        log(f"INFO ghbuilder: uploading encrypted bundle ({len(encrypted) // 1024} KiB) to {gh.repo}")
+        gh.push_bundle(job, encrypted)
+        run_id = gh.dispatch(job, args.esphome_version, str(reply.to_public()), project)
         log(f"INFO ghbuilder: GitHub run {run_id} started")
-        conclusion = stream_logs(repo, run_id, job, reply)
+        conclusion = follow_run(gh, run_id, job)
         if conclusion != "success":
             log(f"ERROR ghbuilder: GitHub run finished with {conclusion}")
             return 1
         log("INFO ghbuilder: downloading build artefacts")
-        fetch_result(repo, run_id, job, str(reply), data_dir)
+        unpack_result(gh.download_result(run_id, job), reply, data_dir)
         log("INFO ghbuilder: done")
         return 0
     except Exception as exc:  # noqa: BLE001 — surface any failure as a failed build
         log(f"ERROR ghbuilder: {exc}")
         return 1
     finally:
-        cleanup(repo, job, run_id)
+        gh.cleanup(job, run_id)
 
 
 if __name__ == "__main__":
