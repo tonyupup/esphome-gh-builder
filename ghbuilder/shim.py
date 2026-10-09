@@ -258,13 +258,14 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, on_term)
 
     try:
-        log(f"INFO ghbuilder: bundling {config_path.name} for esphome {args.esphome_version}")
         bundle = make_bundle(config_path)
         encrypted = pyrage.encrypt(bundle, [pyrage.x25519.Recipient.from_str(pubkey)])
-        log(f"INFO ghbuilder: uploading encrypted bundle ({len(encrypted) // 1024} KiB) to {gh.repo}")
         sha = gh.push_bundle(job, encrypted)
         run_id = gh.dispatch(job, args.esphome_version, str(reply.to_public()), project)
-        log(f"INFO ghbuilder: GitHub run {run_id} started")
+        # The run id is the first thing the user sees, so a stuck build can be found on GitHub.
+        log(f"INFO ghbuilder: GitHub run {run_id}: https://github.com/{gh.repo}/actions/runs/{run_id}")
+        log(f"INFO ghbuilder: {config_path.name} with esphome {args.esphome_version} "
+            f"(encrypted bundle {len(encrypted) // 1024} KiB)")
         conclusion = follow_run(gh, run_id, job, sha)
         if conclusion != "success":
             log(f"ERROR ghbuilder: GitHub run finished with {conclusion}")
