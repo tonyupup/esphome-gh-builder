@@ -78,6 +78,7 @@ jobs:
         env:
           ESPHOME_DATA_DIR: ${{ env.DATA_DIR }}
           REPLY_PUBKEY: ${{ inputs.reply_pubkey }}
+          JOB_BRANCH: job/${{ inputs.job }}
         run: |
           cfg="$(python -c "import json;print(json.load(open('/tmp/cfg/.ghbuild.json'))['configuration'])")"
           rm -f /tmp/compile.done; : > /tmp/compile.log

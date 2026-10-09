@@ -4,6 +4,7 @@ usage: stream_log.py <logfile> <donefile> <age-recipient>
 Every ~3s any new bytes are encrypted to the recipient, committed as logs/NNNNNN.age and pushed.
 """
 
+import os
 import subprocess
 import sys
 import time
@@ -38,7 +39,7 @@ def flush() -> bool:
     git("commit", "-qm", f"log {seq}")
     for attempt in range(3):
         try:
-            git("push", "-q", "origin", "HEAD")
+            git("push", "-q", "origin", f"HEAD:refs/heads/{os.environ['JOB_BRANCH']}")
             break
         except subprocess.CalledProcessError:
             time.sleep(1 + attempt)
