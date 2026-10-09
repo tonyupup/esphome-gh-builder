@@ -61,7 +61,8 @@ class GitHub:
         )
 
     def call(self, method: str, path: str, ok: tuple[int, ...] = (200, 201, 202, 204), **kw) -> requests.Response:
-        resp = self.s.request(method, f"{API}/repos/{self.repo}/{path}", timeout=60, **kw)
+        url = f"{API}/repos/{self.repo}" + (f"/{path}" if path else "")
+        resp = self.s.request(method, url, timeout=60, **kw)
         if resp.status_code not in ok:
             raise RuntimeError(f"GitHub {method} {path.split('?')[0]} -> {resp.status_code}: {resp.text[:200]}")
         return resp
