@@ -1,13 +1,12 @@
 # Strategic-merge patch: adds the GitHub-Actions build server as a sidecar of the existing `esphome` Deployment.
 #   kubectl patch deploy esphome -n default --patch-file k8s/esphome-patch.yaml
-# Image is built by the gh_registry project (images/esphome-gh-builder, submodule of this repo).
 # The pod runs with hostNetwork, so the sidecar's peer-link port 6055 is served on the node IP directly.
 spec:
   template:
     spec:
       containers:
         - name: gh-builder
-          image: ghcr.dockerproxy.zltop.cn/tonyupup/esphome-gh-builder:latest
+          image: ghcr.io/tonyupup/esphome-gh-builder:latest
           imagePullPolicy: Always
           env:
             - name: GHB_REPO
