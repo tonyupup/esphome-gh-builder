@@ -57,7 +57,9 @@ jobs:
         id: pcache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.DATA_DIR }}/build
+          path: |
+            ${{ env.DATA_DIR }}/build
+            ${{ env.DATA_DIR }}/storage
           key: build-${{ inputs.project }}-${{ inputs.esphome_version }}-${{ github.run_id }}
           restore-keys: build-${{ inputs.project }}-${{ inputs.esphome_version }}-
 
@@ -151,7 +153,9 @@ jobs:
         if: always() && steps.compile.conclusion != 'skipped'
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.DATA_DIR }}/build
+          path: |
+            ${{ env.DATA_DIR }}/build
+            ${{ env.DATA_DIR }}/storage
           key: build-${{ inputs.project }}-${{ inputs.esphome_version }}-${{ github.run_id }}
 
       - name: Pack and encrypt result
