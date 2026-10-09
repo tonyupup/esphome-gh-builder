@@ -106,20 +106,24 @@ def dispatch(repo: str, job: str, version: str, reply_pubkey: str) -> int:
 def stream_logs(repo: str, run_id: int, state: dict) -> str:
     """Follow the run, printing new log lines; return the final conclusion."""
     printed = 0
+    final = False
     while True:
         run = gh_json("api", f"repos/{repo}/actions/runs/{run_id}", "-q", ".")
         jobs = gh_json("api", f"repos/{repo}/actions/runs/{run_id}/jobs", "-q", ".jobs") or []
         if jobs:
             job_id = jobs[0]["id"]
             state["job_id"] = job_id
-            proc = gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs", check=False)
+            proc = gh("api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job_id}/logs", check=False)
             if proc.returncode == 0:
                 lines = proc.stdout.decode(errors="replace").splitlines()
                 for line in lines[printed:]:
                     log(re.sub(r"^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z ", "", line))
                 printed = len(lines)
         if run["status"] == "completed":
-            return run["conclusion"] or "failure"
+            if final:
+                return run["conclusion"] or "failure"
+            final = True  # one more pass so the tail of the log is flushed
+            continue
         time.sleep(POLL_SECONDS)
 
 
@@ -139,7 +143,7 @@ def fetch_result(repo: str, run_id: int, job: str, identity: str, data_dir: Path
 
 def cleanup(repo: str, job: str, run_id: int | None) -> None:
     gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/job/{job}", check=False)
-    if run_id:
+    if run_id and not os.environ.get("GHB_KEEP_RUN"):
         gh("api", "-X", "DELETE", f"repos/{repo}/actions/runs/{run_id}", check=False)
 
 
