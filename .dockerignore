@@ -1,5 +1,0 @@
-.venv
-.git
-k8s
-__pycache__
-*.pyc
