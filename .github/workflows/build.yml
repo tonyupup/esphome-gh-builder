@@ -1,0 +1,106 @@
+name: Remote build
+
+# 所有进出本仓库的内容都用 age 加密：bundle 用 BUILD_AGE_PUBKEY 加密后放在 job/<id> 分支，
+# 编译结果用调用方每个任务临时生成的 reply_pubkey 加密后作为 artifact。
+run-name: build ${{ inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: job id (branch job/<id> holds bundle.tar.gz.age)
+        required: true
+      esphome_version:
+        description: esphome version to install
+        required: true
+      reply_pubkey:
+        description: age recipient used to encrypt the result
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  DATA_DIR: /home/runner/esphome-data
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: job/${{ inputs.job }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ inputs.esphome_version }}-${{ github.run_id }}
+          restore-keys: pio-${{ inputs.esphome_version }}-
+
+      - name: Install tools
+        run: pip install -q "esphome==${{ inputs.esphome_version }}" pyrage==1.2.5
+
+      - name: Decrypt bundle
+        env:
+          BUILD_AGE_KEY: ${{ secrets.BUILD_AGE_KEY }}
+        run: |
+          python - <<'EOF'
+          import os, pyrage
+          ident = pyrage.x25519.Identity.from_str(os.environ["BUILD_AGE_KEY"])
+          data = pyrage.decrypt(open("bundle.tar.gz.age", "rb").read(), [ident])
+          open("/tmp/bundle.tar.gz", "wb").write(data)
+          EOF
+          rm bundle.tar.gz.age
+          mkdir -p /tmp/cfg && tar -xzf /tmp/bundle.tar.gz -C /tmp/cfg
+          rm /tmp/bundle.tar.gz
+
+      # 公开仓库日志是公开的：把 secrets.yaml 里所有值登记为 mask，GitHub 会在日志里打码。
+      - name: Mask secrets
+        run: |
+          python - <<'EOF'
+          import glob, os, yaml
+          for p in glob.glob("/tmp/cfg/**/secrets.yaml", recursive=True):
+              for v in (yaml.safe_load(open(p)) or {}).values():
+                  v = str(v)
+                  if len(v) >= 4:
+                      for part in v.splitlines():
+                          print(f"::add-mask::{part}")
+          EOF
+
+      - name: Compile
+        id: compile
+        working-directory: /tmp/cfg
+        env:
+          ESPHOME_DATA_DIR: ${{ env.DATA_DIR }}
+        run: |
+          cfg="$(python -c "import json;print(json.load(open('/tmp/cfg/.ghbuild.json'))['configuration'])")"
+          esphome --dashboard compile "$cfg"
+
+      - name: Pack and encrypt result
+        if: success()
+        env:
+          REPLY_PUBKEY: ${{ inputs.reply_pubkey }}
+        run: |
+          cd "$DATA_DIR"
+          tar -czf /tmp/result.tar.gz idedata storage build
+          python - <<'EOF'
+          import os, pyrage
+          rcpt = pyrage.x25519.Recipient.from_str(os.environ["REPLY_PUBKEY"])
+          data = open("/tmp/result.tar.gz", "rb").read()
+          open("/tmp/result.tar.gz.age", "wb").write(pyrage.encrypt(data, [rcpt]))
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: result-${{ inputs.job }}
+          path: /tmp/result.tar.gz.age
+          retention-days: 1
+          compression-level: 0
