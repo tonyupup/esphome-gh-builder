@@ -21,7 +21,7 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write   # push encrypted log chunks to the job/<id> branch
 
 env:
   DATA_DIR: /home/runner/esphome-data
@@ -72,27 +72,23 @@ jobs:
           mkdir -p /tmp/cfg && tar -xzf /tmp/bundle.tar.gz -C /tmp/cfg
           rm /tmp/bundle.tar.gz
 
-      # 公开仓库日志是公开的：把 secrets.yaml 里所有值登记为 mask，GitHub 会在日志里打码。
-      - name: Mask secrets
-        run: |
-          python - <<'EOF'
-          import glob, os, yaml
-          for p in glob.glob("/tmp/cfg/**/secrets.yaml", recursive=True):
-              for v in (yaml.safe_load(open(p)) or {}).values():
-                  v = str(v)
-                  if len(v) >= 4:
-                      for part in v.splitlines():
-                          print(f"::add-mask::{part}")
-          EOF
-
+      # 编译输出不进公开的 Actions 日志，而是写文件，由 stream_log.py 加密后分块推到 job 分支。
       - name: Compile
         id: compile
-        working-directory: /tmp/cfg
         env:
           ESPHOME_DATA_DIR: ${{ env.DATA_DIR }}
+          REPLY_PUBKEY: ${{ inputs.reply_pubkey }}
         run: |
           cfg="$(python -c "import json;print(json.load(open('/tmp/cfg/.ghbuild.json'))['configuration'])")"
-          esphome --dashboard compile "$cfg"
+          rm -f /tmp/compile.done; : > /tmp/compile.log
+          python ghbuilder/stream_log.py /tmp/compile.log /tmp/compile.done "$REPLY_PUBKEY" &
+          streamer=$!
+          set +e
+          (cd /tmp/cfg && esphome --dashboard compile "$cfg") > /tmp/compile.log 2>&1
+          rc=$?
+          touch /tmp/compile.done
+          wait $streamer
+          exit $rc
 
       - name: Save project build cache
         if: always() && steps.compile.conclusion != 'skipped'

@@ -35,7 +35,7 @@ from pathlib import Path
 import pyrage
 
 RUNNER_DATA_DIR = "/home/runner/esphome-data"
-POLL_SECONDS = 4
+POLL_SECONDS = 3
 WORKFLOW = "build.yml"
 EXCLUDE_TOP = {".esphome", "__pycache__", ".git"}
 
@@ -112,22 +112,41 @@ def dispatch(repo: str, job: str, version: str, reply_pubkey: str, project: str)
     raise RuntimeError("workflow run did not appear within 120s")
 
 
-def stream_logs(repo: str, run_id: int, state: dict) -> str:
-    """Follow the run, printing new log lines; return the final conclusion."""
-    printed = 0
+def stream_logs(repo: str, run_id: int, job: str, identity: pyrage.x25519.Identity) -> str:
+    """Follow the run: print step progress, then decrypted log chunks pushed to the job branch."""
+    seen: set[str] = set()
+    steps_seen: dict[str, str] = {}
+
+    def drain_chunks() -> None:
+        proc = gh("api", f"repos/{repo}/contents/logs?ref=job/{job}", check=False)
+        if proc.returncode:
+            return
+        for entry in sorted(json.loads(proc.stdout), key=lambda e: e["name"]):
+            if entry["name"] in seen:
+                continue
+            raw = gh(
+                "api", "-H", "Accept: application/vnd.github.raw",
+                f"repos/{repo}/contents/logs/{entry['name']}?ref=job/{job}", check=False,
+            )
+            if raw.returncode:
+                break  # not readable yet; retry next poll, keeping order
+            seen.add(entry["name"])
+            sys.stdout.write(pyrage.decrypt(raw.stdout, [identity]).decode(errors="replace"))
+            sys.stdout.flush()
+
     final = False
     while True:
         run = gh_json("api", f"repos/{repo}/actions/runs/{run_id}", "-q", ".")
         jobs = gh_json("api", f"repos/{repo}/actions/runs/{run_id}/jobs", "-q", ".jobs") or []
-        if jobs:
-            job_id = jobs[0]["id"]
-            state["job_id"] = job_id
-            proc = gh("api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job_id}/logs", check=False)
-            if proc.returncode == 0:
-                lines = proc.stdout.decode(errors="replace").splitlines()
-                for line in lines[printed:]:
-                    log(re.sub(r"^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z ", "", line))
-                printed = len(lines)
+        for step in (jobs[0]["steps"] if jobs else []):
+            name = step["name"]
+            if name == "Compile" or name.startswith(("Post ", "Complete")) or name == "Set up job":
+                continue
+            if step["status"] != steps_seen.get(name) and step["status"] in ("in_progress", "completed"):
+                steps_seen[name] = step["status"]
+                if step["status"] == "in_progress":
+                    log(f"INFO ghbuilder: {name}...")
+        drain_chunks()
         if run["status"] == "completed":
             if final:
                 return run["conclusion"] or "failure"
@@ -186,7 +205,6 @@ def main(argv: list[str]) -> int:
     config_path = Path(args.configuration).resolve()
     job = uuid.uuid4().hex[:12]
     reply = pyrage.x25519.Identity.generate()
-    state: dict = {}
     run_id: int | None = None
 
     def on_term(*_):
@@ -206,7 +224,7 @@ def main(argv: list[str]) -> int:
         push_bundle(repo, job, encrypted)
         run_id = dispatch(repo, job, args.esphome_version, str(reply.to_public()), project_key(args.configuration))
         log(f"INFO ghbuilder: GitHub run {run_id} started")
-        conclusion = stream_logs(repo, run_id, state)
+        conclusion = stream_logs(repo, run_id, job, reply)
         if conclusion != "success":
             log(f"ERROR ghbuilder: GitHub run finished with {conclusion}")
             return 1
